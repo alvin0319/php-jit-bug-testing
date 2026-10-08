@@ -1,0 +1,101 @@
+name: Windows Test
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      parents:
+        description: 'Parent processes to start per job'
+        default: '5'
+      runs:
+        description: 'Child processes to start per parent'
+        default: '50'
+
+jobs:
+  repro:
+    name: PHP ${{ matrix.php }} ${{ matrix.ts }} (JIT ${{ matrix.jit }})
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        php: [8.3.35, 8.4.26, 8.5.11, 8.6.0RC3]
+        ts: [ts, nts]
+        jit: ['on', 'off']
+        include:
+          - php: 8.3.35
+            dir: releases
+            vs: vs16
+            opcache-dll: true
+          - php: 8.4.26
+            dir: releases
+            vs: vs17
+            opcache-dll: true
+          - php: 8.5.11
+            dir: releases
+            vs: vs17
+            opcache-dll: false
+          - php: 8.6.0RC3
+            dir: qa/archives
+            vs: vs18
+            opcache-dll: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download PHP ${{ matrix.php }} ${{ matrix.ts }}
+        run: |
+          $tsPart = if ("${{ matrix.ts }}" -eq "nts") { "nts-" } else { "" }
+          $url = "https://downloads.php.net/~windows/${{ matrix.dir }}/php-${{ matrix.php }}-${tsPart}Win32-${{ matrix.vs }}-x64.zip"
+          echo "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile php.zip
+          Expand-Archive php.zip -DestinationPath php
+
+      - name: Write child.ini
+        run: |
+          $lines = @("[PHP]", "extension_dir=$pwd\php\ext")
+          if ("${{ matrix.opcache-dll }}" -eq "true") {
+            $lines += "zend_extension=php_opcache.dll"
+          }
+          $lines += @(
+            "opcache.enable=1",
+            "opcache.enable_cli=1",
+            "opcache.protect_memory=1",
+            "opcache.jit_buffer_size=128M"
+          )
+          if ("${{ matrix.jit }}" -eq "on") {
+            $lines += "opcache.jit=1205"
+          } else {
+            $lines += "opcache.jit=disable"
+          }
+          $lines | Set-Content child.ini
+          Get-Content child.ini
+
+      - name: Check JIT state
+        run: |
+          .\php\php.exe -n -c child.ini -v
+          $enabled = .\php\php.exe -n -c child.ini -r "echo json_encode(opcache_get_status(false)['jit']['enabled']);"
+          $expected = if ("${{ matrix.jit }}" -eq "on") { "true" } else { "false" }
+          echo "JIT enabled: $enabled (expected $expected)"
+          if ($enabled -ne $expected) { exit 1 }
+
+      - name: Run repro
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $parents = "${{ github.event.inputs.parents }}"
+          if (-not $parents) { $parents = "5" }
+          $runs = "${{ github.event.inputs.runs }}"
+          if (-not $runs) { $runs = "50" }
+          $summary = @()
+          $crashedParents = 0
+          for ($parent = 1; $parent -le [int]$parents; $parent++) {
+            echo "::group::Parent $parent"
+            $output = .\php\php.exe -n -c child.ini repro-parent.php true $runs
+            $exitCode = $LASTEXITCODE
+            $output
+            echo "::endgroup::"
+            $summary += "parent ${parent}: $($output | Select-Object -Last 1)"
+            if ($exitCode -ne 0) { $crashedParents++ }
+          }
+          $summary
+          echo "$crashedParents / $parents parents saw crashing children"
+          if ($crashedParents -gt 0) { exit 1 }
